@@ -1,0 +1,788 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate project
+        run: |
+          mkdir -p src_build/app/src/main/java/com/berrymacro src_build/app/src/main/res/xml src_build/app/src/main/res/values
+          cat > src_build/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "BerryMacro"
+          include(":app")
+          EOF
+          cat > src_build/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > src_build/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          EOF
+          cat > src_build/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.berrymacro"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.berrymacro"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+          cat > src_build/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@android:drawable/ic_media_play"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".MacroService"
+                      android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_service_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > src_build/app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          EOF
+          cat > src_build/app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">베리 매크로</string>
+              <string name="service_desc">화면에 터치와 스와이프를 대신 보내서 기록한 동작을 반복합니다.</string>
+          </resources>
+          EOF
+          cat > src_build/app/src/main/java/com/berrymacro/Model.kt <<'EOF'
+          package com.berrymacro
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          /** 기록된 동작 하나. 탭이면 (x1,y1)만, 스와이프면 (x1,y1)→(x2,y2). */
+          data class Step(
+              val x1: Float,
+              val y1: Float,
+              val x2: Float,
+              val y2: Float,
+              val durMs: Long,
+              val waitMs: Long
+          ) {
+              val isSwipe: Boolean
+                  get() = Math.hypot((x2 - x1).toDouble(), (y2 - y1).toDouble()) > 24.0
+
+              fun label(): String =
+                  if (isSwipe) {
+                      "스와이프 (${x1.toInt()},${y1.toInt()})→(${x2.toInt()},${y2.toInt()}) ${durMs}ms"
+                  } else {
+                      "탭 (${x1.toInt()},${y1.toInt()}) ${durMs}ms"
+                  }
+          }
+
+          data class Config(
+              val repeat: Int = 0,            // 0 = 무한 반복
+              val defaultWaitMs: Long = 1500, // 새 동작 기록 시 기본 대기 시간
+              val delayJitterPct: Int = 15,   // 대기 시간 ±%
+              val posJitterPx: Int = 5        // 터치 위치 ±px
+          )
+
+          object Store {
+              private const val PREFS = "berry_macro"
+
+              private fun prefs(c: Context) = c.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+              fun steps(c: Context): MutableList<Step> {
+                  val out = mutableListOf<Step>()
+                  val raw = prefs(c).getString("steps", "[]") ?: "[]"
+                  try {
+                      val arr = JSONArray(raw)
+                      for (i in 0 until arr.length()) {
+                          val o = arr.getJSONObject(i)
+                          out.add(
+                              Step(
+                                  o.getDouble("x1").toFloat(),
+                                  o.getDouble("y1").toFloat(),
+                                  o.getDouble("x2").toFloat(),
+                                  o.getDouble("y2").toFloat(),
+                                  o.getLong("dur"),
+                                  o.getLong("wait")
+                              )
+                          )
+                      }
+                  } catch (_: Exception) {
+                      // 저장 데이터가 깨졌으면 빈 목록으로 시작
+                  }
+                  return out
+              }
+
+              fun saveSteps(c: Context, steps: List<Step>) {
+                  val arr = JSONArray()
+                  for (s in steps) {
+                      val o = JSONObject()
+                      o.put("x1", s.x1.toDouble())
+                      o.put("y1", s.y1.toDouble())
+                      o.put("x2", s.x2.toDouble())
+                      o.put("y2", s.y2.toDouble())
+                      o.put("dur", s.durMs)
+                      o.put("wait", s.waitMs)
+                      arr.put(o)
+                  }
+                  prefs(c).edit().putString("steps", arr.toString()).apply()
+              }
+
+              fun config(c: Context): Config {
+                  val p = prefs(c)
+                  val d = Config()
+                  return Config(
+                      repeat = p.getInt("repeat", d.repeat),
+                      defaultWaitMs = p.getLong("defaultWait", d.defaultWaitMs),
+                      delayJitterPct = p.getInt("delayJitter", d.delayJitterPct),
+                      posJitterPx = p.getInt("posJitter", d.posJitterPx)
+                  )
+              }
+
+              fun saveConfig(c: Context, cfg: Config) {
+                  prefs(c).edit()
+                      .putInt("repeat", cfg.repeat)
+                      .putLong("defaultWait", cfg.defaultWaitMs)
+                      .putInt("delayJitter", cfg.delayJitterPct)
+                      .putInt("posJitter", cfg.posJitterPx)
+                      .apply()
+              }
+          }
+          EOF
+          cat > src_build/app/src/main/java/com/berrymacro/MacroService.kt <<'EOF'
+          package com.berrymacro
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.random.Random
+
+          class MacroService : AccessibilityService() {
+
+              companion object {
+                  @Volatile
+                  var instance: MacroService? = null
+              }
+
+              private val handler = Handler(Looper.getMainLooper())
+              private val wm by lazy { getSystemService(WINDOW_SERVICE) as WindowManager }
+
+              private var panel: LinearLayout? = null
+              private var recorder: FrameLayout? = null
+              private var status: TextView? = null
+              private var toggleBtn: Button? = null
+
+              private var running = false
+              private var cycleDone = 0
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  instance = this
+                  showPanel()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+
+              override fun onInterrupt() {
+                  stopMacro()
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  stopMacro()
+                  removeRecorder()
+                  removePanel()
+                  instance = null
+                  return super.onUnbind(intent)
+              }
+
+              // ───────────── 플로팅 패널 ─────────────
+
+              fun showPanel() {
+                  if (panel != null) return
+                  val density = resources.displayMetrics.density
+                  fun dp(v: Int) = (v * density).toInt()
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.argb(210, 20, 20, 30))
+                      setPadding(dp(6), dp(6), dp(6), dp(6))
+                  }
+
+                  val st = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 11f
+                      setPadding(dp(2), dp(2), dp(2), dp(4))
+                  }
+                  status = st
+
+                  fun makeButton(label: String, onClick: () -> Unit): Button {
+                      val b = Button(this)
+                      b.text = label
+                      b.textSize = 12f
+                      b.minWidth = 0
+                      b.minimumWidth = 0
+                      b.minHeight = 0
+                      b.minimumHeight = 0
+                      b.setPadding(dp(10), dp(6), dp(10), dp(6))
+                      b.setOnClickListener { onClick() }
+                      return b
+                  }
+
+                  val toggle = makeButton("▶") { toggleMacro() }
+                  toggleBtn = toggle
+
+                  val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  row.addView(toggle)
+                  row.addView(makeButton("● 기록") { startRecording() })
+                  row.addView(makeButton("↩") { undoLast() })
+                  row.addView(makeButton("✕") { removePanel() })
+
+                  root.addView(st)
+                  root.addView(row)
+
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  lp.gravity = Gravity.TOP or Gravity.START
+                  lp.x = dp(8)
+                  lp.y = dp(8)
+
+                  // 상태 글자를 끌면 패널 이동
+                  var downX = 0f
+                  var downY = 0f
+                  var startX = 0
+                  var startY = 0
+                  st.setOnTouchListener { _, e ->
+                      when (e.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              downX = e.rawX
+                              downY = e.rawY
+                              startX = lp.x
+                              startY = lp.y
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              lp.x = startX + (e.rawX - downX).toInt()
+                              lp.y = startY + (e.rawY - downY).toInt()
+                              wm.updateViewLayout(root, lp)
+                          }
+                      }
+                      true
+                  }
+
+                  wm.addView(root, lp)
+                  panel = root
+                  idleStatus()
+              }
+
+              private fun removePanel() {
+                  panel?.let {
+                      try {
+                          wm.removeView(it)
+                      } catch (_: Exception) {
+                      }
+                  }
+                  panel = null
+                  status = null
+                  toggleBtn = null
+              }
+
+              private fun idleStatus() {
+                  val n = Store.steps(this).size
+                  setStatus("동작 ${n}개 · 끌어서 이동")
+              }
+
+              private fun setStatus(text: String) {
+                  status?.text = text
+              }
+
+              private fun toast(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+              }
+
+              // ───────────── 기록 ─────────────
+
+              private fun startRecording() {
+                  if (running) {
+                      toast("실행 중에는 기록할 수 없어요")
+                      return
+                  }
+                  if (recorder != null) return
+
+                  val hint = TextView(this).apply {
+                      text = "기록할 동작을 화면에 한 번 하세요\n(탭 / 길게 누르기 / 스와이프)"
+                      setTextColor(Color.WHITE)
+                      textSize = 16f
+                      gravity = Gravity.CENTER
+                  }
+                  val layer = FrameLayout(this)
+                  layer.setBackgroundColor(Color.argb(90, 0, 0, 0))
+                  layer.addView(
+                      hint,
+                      FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT,
+                          Gravity.CENTER
+                      )
+                  )
+
+                  var x1 = 0f
+                  var y1 = 0f
+                  var t0 = 0L
+                  layer.setOnTouchListener { _, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> {
+                              x1 = e.rawX
+                              y1 = e.rawY
+                              t0 = SystemClock.uptimeMillis()
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              val dur = (SystemClock.uptimeMillis() - t0).coerceIn(60L, 5000L)
+                              val cfg = Store.config(this)
+                              val step = Step(x1, y1, e.rawX, e.rawY, dur, cfg.defaultWaitMs)
+                              removeRecorder()
+                              val list = Store.steps(this)
+                              list.add(step)
+                              Store.saveSteps(this, list)
+                              idleStatus()
+                              toast("#${list.size} ${step.label()}")
+                              // 게임 화면이 실제로 진행되도록 기록한 동작을 한 번 그대로 실행
+                              handler.postDelayed({ dispatch(step, 0) { } }, 250)
+                          }
+                          MotionEvent.ACTION_CANCEL -> removeRecorder()
+                      }
+                      true
+                  }
+
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                      PixelFormat.TRANSLUCENT
+                  )
+                  panel?.visibility = View.INVISIBLE
+                  wm.addView(layer, lp)
+                  recorder = layer
+              }
+
+              private fun removeRecorder() {
+                  recorder?.let {
+                      try {
+                          wm.removeView(it)
+                      } catch (_: Exception) {
+                      }
+                  }
+                  recorder = null
+                  panel?.visibility = View.VISIBLE
+              }
+
+              private fun undoLast() {
+                  if (running) return
+                  val list = Store.steps(this)
+                  if (list.isEmpty()) {
+                      toast("지울 동작이 없어요")
+                      return
+                  }
+                  list.removeAt(list.size - 1)
+                  Store.saveSteps(this, list)
+                  idleStatus()
+              }
+
+              // ───────────── 실행 ─────────────
+
+              private fun toggleMacro() {
+                  if (running) stopMacro() else startMacro()
+              }
+
+              private fun startMacro() {
+                  if (recorder != null) return
+                  if (Store.steps(this).isEmpty()) {
+                      toast("기록된 동작이 없어요. ● 기록부터 하세요")
+                      return
+                  }
+                  running = true
+                  cycleDone = 0
+                  toggleBtn?.text = "■"
+                  runStep(0)
+              }
+
+              fun stopMacro() {
+                  running = false
+                  handler.removeCallbacksAndMessages(null)
+                  toggleBtn?.text = "▶"
+                  if (panel != null) idleStatus()
+              }
+
+              private fun runStep(index: Int) {
+                  if (!running) return
+                  val steps = Store.steps(this)
+                  val cfg = Store.config(this)
+                  if (steps.isEmpty()) {
+                      stopMacro()
+                      return
+                  }
+                  if (index >= steps.size) {
+                      cycleDone++
+                      if (cfg.repeat > 0 && cycleDone >= cfg.repeat) {
+                          stopMacro()
+                          toast("완료: ${cycleDone}회 반복")
+                          return
+                      }
+                      runStep(0)
+                      return
+                  }
+                  val s = steps[index]
+                  setStatus("${cycleDone + 1}회차 · ${index + 1}/${steps.size}")
+                  dispatch(s, cfg.posJitterPx) {
+                      val wait = jitter(s.waitMs, cfg.delayJitterPct)
+                      handler.postDelayed({ runStep(index + 1) }, wait)
+                  }
+              }
+
+              private fun dispatch(s: Step, posJitter: Int, onDone: () -> Unit) {
+                  fun j(): Float =
+                      if (posJitter > 0) Random.nextInt(-posJitter, posJitter + 1).toFloat() else 0f
+
+                  val path = Path()
+                  path.moveTo(s.x1 + j(), s.y1 + j())
+                  if (s.isSwipe) path.lineTo(s.x2 + j(), s.y2 + j())
+
+                  val dur = s.durMs.coerceIn(30L, 10_000L)
+                  val gesture = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, dur))
+                      .build()
+
+                  val cb = object : GestureResultCallback() {
+                      override fun onCompleted(gestureDescription: GestureDescription?) {
+                          handler.post(onDone)
+                      }
+
+                      override fun onCancelled(gestureDescription: GestureDescription?) {
+                          handler.post(onDone)
+                      }
+                  }
+                  if (!dispatchGesture(gesture, cb, null)) handler.post(onDone)
+              }
+
+              private fun jitter(base: Long, pct: Int): Long {
+                  if (pct <= 0) return base.coerceAtLeast(200L)
+                  val f = 1.0 + Random.nextInt(-pct, pct + 1) / 100.0
+                  return (base * f).toLong().coerceAtLeast(200L)
+              }
+          }
+          EOF
+          cat > src_build/app/src/main/java/com/berrymacro/MainActivity.kt <<'EOF'
+          package com.berrymacro
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var etRepeat: EditText
+              private lateinit var etWait: EditText
+              private lateinit var etDelayJitter: EditText
+              private lateinit var etPosJitter: EditText
+              private lateinit var stepList: LinearLayout
+
+              private fun px(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(px(16), px(24), px(16), px(24))
+                  val scroll = ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
+
+                  root.addView(title("베리 매크로"))
+                  root.addView(
+                      text(
+                          "사용 순서\n" +
+                              "1) 접근성 서비스를 켠다\n" +
+                              "2) 게임에서 퀘스트 한 사이클을 ● 기록으로 한 동작씩 기록한다\n" +
+                              "3) ▶ 로 반복 실행, ■ 로 정지\n\n" +
+                              "게임은 기록할 때와 같은 방향(가로/세로)으로 실행하세요."
+                      )
+                  )
+
+                  root.addView(button("1) 접근성 설정 열기") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  })
+                  root.addView(button("2) 플로팅 패널 열기") {
+                      val s = MacroService.instance
+                      if (s == null) {
+                          toast("먼저 접근성 설정에서 '베리 매크로'를 켜세요")
+                      } else {
+                          s.showPanel()
+                          toast("게임 화면으로 이동하세요")
+                      }
+                  })
+
+                  root.addView(title("실행 설정"))
+                  etRepeat = field(root, "반복 횟수 (0 = 무한)")
+                  etWait = field(root, "새 동작 기본 대기 (ms)")
+                  etDelayJitter = field(root, "대기 시간 랜덤 ± (%)")
+                  etPosJitter = field(root, "터치 위치 랜덤 ± (px)")
+                  root.addView(button("설정 저장") { saveConfig() })
+
+                  root.addView(title("기록된 동작"))
+                  stepList = LinearLayout(this)
+                  stepList.orientation = LinearLayout.VERTICAL
+                  root.addView(stepList)
+                  root.addView(button("전체 삭제") {
+                      AlertDialog.Builder(this)
+                          .setMessage("기록된 동작을 모두 지울까요?")
+                          .setPositiveButton("삭제") { _, _ ->
+                              Store.saveSteps(this, emptyList())
+                              refreshSteps()
+                          }
+                          .setNegativeButton("취소", null)
+                          .show()
+                  })
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  val c = Store.config(this)
+                  etRepeat.setText(c.repeat.toString())
+                  etWait.setText(c.defaultWaitMs.toString())
+                  etDelayJitter.setText(c.delayJitterPct.toString())
+                  etPosJitter.setText(c.posJitterPx.toString())
+                  refreshSteps()
+              }
+
+              private fun saveConfig() {
+                  val d = Config()
+                  val cfg = Config(
+                      repeat = (etRepeat.text.toString().toIntOrNull() ?: d.repeat).coerceAtLeast(0),
+                      defaultWaitMs = (etWait.text.toString().toLongOrNull() ?: d.defaultWaitMs)
+                          .coerceAtLeast(200L),
+                      delayJitterPct = (etDelayJitter.text.toString().toIntOrNull() ?: d.delayJitterPct)
+                          .coerceIn(0, 90),
+                      posJitterPx = (etPosJitter.text.toString().toIntOrNull() ?: d.posJitterPx)
+                          .coerceIn(0, 50)
+                  )
+                  Store.saveConfig(this, cfg)
+                  toast("저장했어요")
+              }
+
+              private fun refreshSteps() {
+                  stepList.removeAllViews()
+                  val steps = Store.steps(this)
+                  if (steps.isEmpty()) {
+                      stepList.addView(text("아직 기록된 동작이 없어요."))
+                      return
+                  }
+                  steps.forEachIndexed { i, s ->
+                      val row = LinearLayout(this)
+                      row.orientation = LinearLayout.VERTICAL
+                      row.setPadding(0, px(8), 0, px(8))
+                      row.addView(text("#${i + 1}  ${s.label()}\n대기 ${s.waitMs}ms"))
+
+                      val btns = LinearLayout(this)
+                      btns.orientation = LinearLayout.HORIZONTAL
+                      btns.addView(button("대기 수정") { editWait(i) })
+                      btns.addView(button("삭제") {
+                          val list = Store.steps(this)
+                          if (i < list.size) {
+                              list.removeAt(i)
+                              Store.saveSteps(this, list)
+                          }
+                          refreshSteps()
+                      })
+                      row.addView(btns)
+                      stepList.addView(row)
+                  }
+              }
+
+              private fun editWait(index: Int) {
+                  val list = Store.steps(this)
+                  if (index >= list.size) return
+                  val input = EditText(this)
+                  input.inputType = InputType.TYPE_CLASS_NUMBER
+                  input.setText(list[index].waitMs.toString())
+                  AlertDialog.Builder(this)
+                      .setTitle("#${index + 1} 대기 시간 (ms)")
+                      .setView(input)
+                      .setPositiveButton("확인") { _, _ ->
+                          val ms = (input.text.toString().toLongOrNull() ?: list[index].waitMs)
+                              .coerceAtLeast(200L)
+                          list[index] = list[index].copy(waitMs = ms)
+                          Store.saveSteps(this, list)
+                          refreshSteps()
+                      }
+                      .setNegativeButton("취소", null)
+                      .show()
+              }
+
+              // ───────────── UI 도우미 ─────────────
+
+              private fun title(t: String): TextView {
+                  val v = TextView(this)
+                  v.text = t
+                  v.textSize = 20f
+                  v.setPadding(0, px(20), 0, px(8))
+                  return v
+              }
+
+              private fun text(t: String): TextView {
+                  val v = TextView(this)
+                  v.text = t
+                  v.textSize = 14f
+                  return v
+              }
+
+              private fun button(label: String, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              private fun field(parent: LinearLayout, label: String): EditText {
+                  parent.addView(text(label))
+                  val e = EditText(this)
+                  e.inputType = InputType.TYPE_CLASS_NUMBER
+                  parent.addView(e)
+                  return e
+              }
+
+              private fun toast(msg: String) {
+                  Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+              }
+          }
+          EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        working-directory: src_build
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: berry-macro-apk
+          path: src_build/app/build/outputs/apk/debug/app-debug.apk
